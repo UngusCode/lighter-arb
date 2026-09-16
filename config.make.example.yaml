@@ -1,0 +1,43 @@
+# lighter-arb, make mode: rest on the thin venue either side of its premium, hedge every fill on the deep one. Copy to config.yaml. Values written as $ {VAR} (no space) come from the environment.
+# To try it without money, point base_url at the testnets: https://testnet.zklighter.elliot.ai and https://api.rh-testnet.lighter.xyz
+
+leverage: 3  # every market is set to cross margin at this leverage when it enters; isolated where the venue insists (pre-IPO on Lighter)
+
+# quote: the thin venue we rest orders on. hedge: the deep venue we take on. Roles, not names.
+venues:
+  quote:
+    base_url: https://mainnet.zklighter.elliot.ai
+    account_index: ${LIGHTER_ACCOUNT_INDEX}
+    api_key_index: 3
+    api_key_private_key: ${LIGHTER_API_KEY}
+  hedge:
+    base_url: https://api.rh.lighter.xyz
+    account_index: ${RH_ACCOUNT_INDEX}
+    api_key_index: 3
+    api_key_private_key: ${RH_API_KEY}
+# taker_fee_bps: 0             # per venue: what your account pays to take, from the venue's fee schedule; cross mode nets it off the edge
+
+# The markets to trade, each listed on both venues, with a seed for the moving average of the quote venue's premium over
+# the hedge venue in bps, or null to warm it from live data for premium_tau_s before entries rest (the status line prints
+# the running value, which is what to seed with next time). Pick markets where the hedge venue is tight, deep and slow
+# enough to hedge into. A position in any other market is only reduced.
+markets:
+  OPENAI: 60
+  ANTHROPIC: null
+
+# An entry rests on the quote venue only where it sells above what the hedge costs or buys below what the hedge pays,
+# by edge_bps, and never inside the quote venue's own touch: takers crossing that spread fill it. The exit rests where
+# the round trip nets the edge against the pair's own entry gap. Every fill is hedged at once with an IOC on the hedge venue.
+strategy:
+  mode: make                    # make: rest on the quote venue, hedge every fill on the other. cross: take both books wherever they
+                                # cross by more than fees and cross_min_edge_bps, every shared market, nothing resting
+  edge_bps: 20                  # make: an entry rests this far either side of the premium average; a round trip nets at least this
+  premium_tau_s: 900            # make: time constant of the premium average, and the warm-up of an unseeded one
+  cross_min_edge_bps: 10        # cross: take only where the books cross by at least this after both venues' taker fees
+  clip_usd: 100                 # per order
+  max_inventory_usd: 500        # per market on the quote venue; an entry rests only if a clip fits under it, and only while both
+                                # venues have free balance for two clips at `leverage`
+
+drawdown_usd: 50                # halt when venue-reported equity falls this far below its level at start
+liq_buffer: 0.15                # liquidation guard: top up an isolated leg with less than this much adverse room (free); shrink the
+                                # pair, both legs at once, only under half of it. Nothing happens above it, so the edge is untouched

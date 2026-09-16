@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+config.yaml
+ledger.db
+*.log
+HALT
+data/
+
+.ruff_cache/
+.env
+derived/

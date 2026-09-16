@@ -1,0 +1,39 @@
+[project]
+name = "lighter-arb"
+version = "0.1.0"
+description = "Reference bot across Lighter and Lighter on Robinhood Chain: make the thin venue hedged on the deep one, or take the books where they cross"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lighter-sdk",
+    "pydantic>=2.7",
+    "pyyaml>=6",
+    "websockets>=12",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.5"]
+analysis = ["pandas>=2.2", "pyarrow>=15", "matplotlib>=3.8", "orjson>=3.9"]  # analysis/: the recorder, the transform and the chart
+
+[project.scripts]
+lighter-arb = "lighter_arb.bot:cli"
+
+[tool.uv.sources]
+lighter-sdk = { git = "https://github.com/elliottech/lighter-python.git" }
+
+[tool.ruff]
+line-length = 160
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "RET", "PERF", "PL", "RUF", "PTH", "ASYNC", "C90", "TC", "ARG"]
+ignore = ["E501", "PLR2004", "PLR0913", "TC001", "TC003"]
+mccabe.max-complexity = 16
+[tool.ruff.lint.pylint]
+max-branches = 18
+max-args = 8
+max-statements = 65
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
