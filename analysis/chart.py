@@ -3,7 +3,7 @@
 results/touch_cross.png: the touch cross second by second for five markets. Above the line Lighter's bid is over
 Robinhood Chain's ask; below it Robinhood Chain's bid is over Lighter's ask; on the line nothing crosses.
 results/why_make.png: why the maker rests an ask on Lighter and hedges on Robinhood Chain. Top: ANTHROPIC's premium over
-the night, its 15-minute average and the line above it where the ask rests. Bottom: the median cost of taking 500 and
+the night, its 15-minute average and the line 10 bps above it where the ask rests. Bottom: the median cost of taking 500 and
 2,000 USD on each venue, from the books walked every second."""
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
 BLUE, RED, ORANGE = "#2a78d6", "#e34948", "#eb6834"
 CLIPS = (100, 500, 2000)
-EDGE_BPS = 15.0
+EDGE_BPS = 10.0
 TAU_S = 900.0
 SYMS = ["OPENAI", "ANTHROPIC", "QQQ", "AI", "BTC"]
 NOTES = {
