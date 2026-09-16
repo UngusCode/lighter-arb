@@ -17,7 +17,7 @@ from .strategy import Average, Top, cross, quotes
 from .venue import Venue
 
 log = Log("bot")
-HEDGE_WAIT_S = 5.0  # a hedge IOC is in flight until the socket shows the hedge venue's position move, or this long: fill reports can lag
+HEDGE_WAIT_S = 5.0  # an IOC is in flight until every venue it went to shows its position move, or this long: fill reports can lag
 STATUS_EVERY_S = 60
 DUST_USD = 1.0  # unhedged notional below this is left alone; a taker order can be any size, so this is only about not spamming
 ENTRY_PAUSE_S = 2.0  # no new entry on a market this soon after a fill there: the position it is sized against must include the fill
@@ -26,18 +26,19 @@ HEDGE_SLIP_BPS = 50.0  # a hedge IOC is limited this far past the touch: a cap, 
 MAX_BOOK_AGE_MS = 1500.0  # older books on either venue pull the quotes
 DEADMAN_REFRESH_S, DEADMAN_WINDOW_S = 30.0, 360.0  # the scheduled cancel-all, refreshed this often, with this deadline (venue minimum 5 min)
 HALT_FILE = "HALT"  # touch it to halt
+SNAPSHOT_WAIT_S = 30.0  # startup gives the venues this long to send their account snapshots
 
 
 class Bot:
     def __init__(self, cfg: Config) -> None:
         self.cfg, self.c = cfg, cfg.strategy
-        self.q, self.h = Venue("quote", cfg.venues["quote"]), Venue("hedge", cfg.venues["hedge"])
+        self.q, self.h = Venue("quote", cfg.venues["quote"], cfg.leverage), Venue("hedge", cfg.venues["hedge"], cfg.leverage)
         self.guard = Guard(cfg.liq_buffer)
         self.shrunk: dict[str, float] = {}  # symbol -> when the guard last shrank the pair
         self.equity0: float | None = None  # combined equity at the first reading; the drawdown halt measures from here
         self.selected = set(cfg.markets)  # the markets traded; a position anywhere else is inherited: only reduced, and its loop stops once flat
         self.loops: dict[str, asyncio.Task[None]] = {}
-        self.hedge_sent: dict[str, tuple[float, float]] = {}  # symbol -> (when, hedge-venue position then) of the last hedge IOC
+        self.sent: dict[str, tuple[float, dict[Venue, float]]] = {}  # symbol -> (when, position on each venue an IOC went to) of the last IOCs
         self.hedge_tries: dict[str, int] = {}  # symbol -> hedge IOCs sent for the mismatch that is still standing
         self._state: dict[str, dict] = {}  # latest numbers per market, for the status line
         self.halted: str | None = None
@@ -63,57 +64,57 @@ class Bot:
             if not qt or not ht or max(qt.age_ms, ht.age_ms) > MAX_BOOK_AGE_MS:
                 await self.q.sync(symbol, {})  # a stale side: nothing rests until both books are current
                 continue
-            pos, mid = self.q.position(symbol), (ht.bid + ht.ask) / 2
-            gap = ((qt.bid + qt.ask) / 2 / mid - 1) * 1e4
+            pos, mid, qmid = self.q.position(symbol), (ht.bid + ht.ask) / 2, (qt.bid + qt.ask) / 2
+            gap = (qmid / mid - 1) * 1e4
             premium.update(gap, time.time())
             want = quotes(qt, ht, pos, self.c, self.entry_gap(symbol), premium.value or 0.0) if making else []
             mismatch = pos + self.h.position(symbol)  # base units not hedged
-            dust = DUST_USD
-            shrink = await self.guard.step(symbol, (self.q, self.h), abs(pos) * mid)
+            buffers = {self.q: self.q.buffer(symbol, qmid), self.h: self.h.buffer(symbol, mid)}
+            shrink = await self.guard.step(symbol, buffers, abs(pos) * mid)
             if shrink and pos and time.time() - self.shrunk.get(symbol, 0) >= 1:  # too close to liquidation: both legs off, at once
                 self.shrunk[symbol] = time.time()
-                log.warning("guard.shrink", symbol=symbol, fraction=round(shrink, 3), buffers={v.name: v.buffer(symbol) for v in (self.q, self.h)})
-                await self.q.take(symbol, pos > 0, abs(pos) * shrink, HEDGE_SLIP_BPS)
-                await self.h.take(symbol, pos < 0, abs(pos) * shrink, HEDGE_SLIP_BPS)
-            need = 2 * self.c.clip_usd / self.cfg.leverage  # margin for a clip on each venue, with a second clip behind it
-            if (
-                symbol not in self.selected
-                or not premium.warm(time.time())
-                or shrink
-                or time.time() - self.q.last_fill.get(symbol, 0) < ENTRY_PAUSE_S
-                or min(self.q.free(), self.h.free()) < need
-            ):
+                log.warning("guard.shrink", symbol=symbol, fraction=round(shrink, 3), buffers={v.name: b for v, b in buffers.items()})
+                await self.ioc(symbol, [(self.q, pos > 0, abs(pos) * shrink, None), (self.h, pos < 0, abs(pos) * shrink, None)])
+            short = min(self.q.free(), self.h.free()) < 2 * self.c.clip_usd / self.cfg.leverage  # a clip on each venue, with a second behind it
+            if symbol not in self.selected or not premium.warm(time.time()) or shrink or time.time() - self.q.last_fill.get(symbol, 0) < ENTRY_PAUSE_S or short:
                 # inherited, average still warming, shrinking, just filled (let the position catch up), or a venue short of margin: only the reducing side
                 want = [w for w in want if pos and (pos > 0) == w.is_ask]
-                if not pos and abs(mismatch) * mid < dust and not self.q.resting(symbol) and symbol not in self.selected:
+                if not pos and abs(mismatch) * mid < DUST_USD and not self.q.resting(symbol) and symbol not in self.selected:
                     break
             self._state[symbol] = {
                 "gap": round(gap, 1),
                 "premium": round(premium.value or 0.0, 1) if premium.warm(time.time()) else None,
                 "orders": len(self.q.resting(symbol)),
-                "buffer": min((round(b, 3) for v in (self.q, self.h) if (b := v.buffer(symbol)) is not None), default=None),
+                "buffer": min((round(b, 3) for b in buffers.values() if b is not None), default=None),
                 "inv_usd": round(pos * mid, 1),
                 "unhedged_usd": round(mismatch * mid, 2),
             }
-            sent = self.hedge_sent.get(symbol)  # one hedge at a time, sequenced on the same feed the position comes from
-            in_flight = sent is not None and time.time() - sent[0] < HEDGE_WAIT_S and self.h.position(symbol) == sent[1]
-            if abs(mismatch) * mid < dust:
+            if abs(mismatch) * mid < DUST_USD:
                 self.hedge_tries.pop(symbol, None)
-                if not making and not in_flight and not shrink and symbol in self.selected:
+                if not making and not self.in_flight(symbol) and not shrink and not short and symbol in self.selected:
                     await self.take_cross(symbol, qt, ht, pos, mid)
-            elif not in_flight:
+            elif not self.in_flight(symbol):
                 tries = self.hedge_tries[symbol] = self.hedge_tries.get(symbol, 0) + 1
-                self.hedge_sent[symbol] = (time.time(), self.h.position(symbol))
                 v = self.h if tries <= HEDGE_TRIES else self.q  # the hedge venue will not take it (margin, depth): undo the fill instead
                 if v is self.q:
                     self.hedge_tries.pop(symbol, None)
                     log.warning("hedge.undo", symbol=symbol, unhedged_usd=round(mismatch * mid, 2))
-                await v.take(symbol, mismatch > 0, abs(mismatch), HEDGE_SLIP_BPS)
+                await self.ioc(symbol, [(v, mismatch > 0, abs(mismatch), None)])
             await self.q.sync(symbol, {w.is_ask: w for w in want})
         await self.q.sync(symbol, {})
         if making:
             await self.q.watch(symbol, on=False)
         log.info("market.stopped", symbol=symbol)
+
+    async def ioc(self, symbol: str, legs: list[tuple[Venue, bool, float, float | None]]) -> None:
+        """IOCs on one or both venues at once, as (venue, is_ask, size, limit). Nothing else goes out on this market until every
+        venue sent to shows its position move, or HEDGE_WAIT_S: fill reports can lag, and one leg's report can land before the other's."""
+        self.sent[symbol] = (time.time(), {v: v.position(symbol) for v, *_ in legs})
+        await asyncio.gather(*(v.take(symbol, is_ask, size, HEDGE_SLIP_BPS, limit) for v, is_ask, size, limit in legs))
+
+    def in_flight(self, symbol: str) -> bool:
+        when, before = self.sent.get(symbol, (0.0, {}))
+        return time.time() - when < HEDGE_WAIT_S and any(v.position(symbol) == p for v, p in before.items())
 
     async def take_cross(self, symbol: str, qt: Top, ht: Top, pos: float, mid: float) -> None:
         """Cross mode: where one venue's bids sit over the other's asks by more than both taker fees and the minimum edge, take
@@ -130,11 +131,7 @@ class Bot:
         if size * mid < DUST_USD:
             return
         log.info("cross", symbol=symbol, side="sell quote, buy hedge" if sell_q else "buy quote, sell hedge", size=round(size, 6), edge_bps=round(edge, 1))
-        self.hedge_sent[symbol] = (time.time(), self.h.position(symbol))  # both legs are in flight: no hedge until the venues answer
-        await asyncio.gather(
-            self.q.take(symbol, sell_q, size, HEDGE_SLIP_BPS, limit=bid_lim if sell_q else ask_lim),
-            self.h.take(symbol, not sell_q, size, HEDGE_SLIP_BPS, limit=ask_lim if sell_q else bid_lim),
-        )
+        await self.ioc(symbol, [(self.q, sell_q, size, bid_lim if sell_q else ask_lim), (self.h, not sell_q, size, ask_lim if sell_q else bid_lim)])
 
     def entry_gap(self, symbol: str) -> float | None:
         """The gap a held pair was put on at, from the venues' average entry prices; None unless both legs are on."""
@@ -191,7 +188,12 @@ class Bot:
         for v in (self.q, self.h):
             await v.start(self.selected)
         tasks = [asyncio.create_task(v.run_ws()) for v in (self.q, self.h)]
-        await asyncio.sleep(3)  # the account snapshots: positions and collateral
+        for _ in range(int(SNAPSHOT_WAIT_S * 10)):  # the account snapshots: positions and collateral, before anything is decided on them
+            if all(v.equity is not None for v in (self.q, self.h)):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise RuntimeError(f"no account snapshot from both venues within {SNAPSHOT_WAIT_S:.0f} s")
         held = {s for v in (self.q, self.h) for s in v.markets if v.position(s)}
         for v in (self.q, self.h):
             await v.cancel_all()  # a clean slate: nothing of ours rests that this process does not know about
@@ -209,10 +211,11 @@ class Bot:
         try:
             await self.stop.wait()
         finally:
+            for v in (self.q, self.h):
+                await v.cancel_all()  # while the sockets are still up
             for t in tasks + list(self.loops.values()):
                 t.cancel()
             for v in (self.q, self.h):
-                await v.cancel_all()
                 await v.close()
 
 

@@ -1,12 +1,12 @@
 """Make the thin venue's spread around its premium, hedged on the deep venue. Pure.
 
 premium   = a moving average of the thin venue's mid over the deep venue's, in bps; zero means parity
-entry ask = max(hedge ask x (1 + max(premium, 0) + edge), own ask)   opening a short: above the premium, never below parity
-entry bid = min(hedge bid x (1 + min(premium, 0) - edge), own bid)   opening a long: below the discount, never above parity
-The average only ever pushes an entry away from parity, never across it: an entry never buys on the dearer venue or
-sells on the cheaper one. A rich market gets asks only, a cheap one bids only.
-exit      = the pair's own entry gap less twice the edge, so the round trip nets the edge, sized to what is held
-Never inside the thin venue's own touch: a resting order there is filled by takers crossing the thin venue's whole
+entry ask = max(hedge ask x (1 + premium + edge), the rest of the book's ask)   on a rich market: opening a short above the premium
+entry bid = min(hedge bid x (1 + premium - edge), the rest of the book's bid)   on a cheap market: opening a long below the discount
+A rich market gets asks only and a cheap one bids only, so an entry never buys on the dearer venue or sells on the cheaper.
+exit      = the pair's own entry gap less twice the edge, so the round trip nets the edge, sized to what is held; with the
+            entry gap unknown, priced like an entry and never across parity
+Never inside the rest of the thin venue's book: a resting order there is filled by takers crossing the thin venue's whole
 spread, and that spread is the edge. Every fill is hedged at once on the deep venue.
 """
 
@@ -77,18 +77,16 @@ def quotes(q: Top, h: Top, pos: float, c: StrategyCfg, entry_bps: float | None, 
     (thin venue entry over deep venue entry), None when unknown, in which case the exit is priced like an entry;
     premium_bps: the average of the thin venue's mid over the deep venue's, which entries rest either side of."""
     mid = (h.bid + h.ask) / 2
-    clip, inv_usd, e, m = c.clip_usd / mid, pos * mid, c.edge_bps / 1e4, premium_bps / 1e4
-    up, down = max(m, 0.0), min(m, 0.0)  # the premium moves the ask up or the bid down, never a quote across parity
+    clip, e, m = c.clip_usd / mid, c.edge_bps / 1e4, premium_bps / 1e4
+    room = max(0.0, c.max_inventory_usd - abs(pos) * mid) / mid  # an entry is sized to what fits under the cap, at most a clip
+    ask, bid = 1 + max(m, 0.0) + e, 1 + min(m, 0.0) - e  # an entry, or an exit whose entry gap is unknown: never across parity
     out = []
-    room = max(0.0, c.max_inventory_usd - abs(inv_usd)) / mid  # an entry is sized to what fits under the cap, at most a clip
-    if pos > 0:  # closing a long, bought below the deep venue: sell once above the entry gap plus the edge
-        k = 1 + (entry_bps / 1e4 + 2 * e if entry_bps is not None else up + e)
-        out.append(Quote(True, max(h.ask * k, q.ask), min(clip, pos)))
-    elif room > 0:  # opening a short: above the premium by the edge, and above the deep venue whatever the premium
-        out.append(Quote(True, max(h.ask * (1 + up + e), q.ask), min(clip, room)))
-    if pos < 0:  # closing a short, sold above the deep venue: buy once below the entry gap less the edge
-        k = 1 + (entry_bps / 1e4 - 2 * e if entry_bps is not None else down - e)
-        out.append(Quote(False, min(h.bid * k, q.bid), min(clip, -pos)))
-    elif room > 0:  # opening a long: below the discount by the edge, and below the deep venue whatever the premium
-        out.append(Quote(False, min(h.bid * (1 + down - e), q.bid), min(clip, room)))
+    if pos > 0:  # closing a long: sell once the gap is two edges over the entry gap
+        out.append(Quote(True, max(h.ask * (1 + entry_bps / 1e4 + 2 * e if entry_bps is not None else ask), q.ask), min(clip, pos)))
+    elif room > 0 and m >= 0:  # opening a short on a rich market
+        out.append(Quote(True, max(h.ask * ask, q.ask), min(clip, room)))
+    if pos < 0:  # closing a short: buy once the gap is two edges under the entry gap
+        out.append(Quote(False, min(h.bid * (1 + entry_bps / 1e4 - 2 * e if entry_bps is not None else bid), q.bid), min(clip, -pos)))
+    elif room > 0 and m <= 0:  # opening a long on a cheap market
+        out.append(Quote(False, min(h.bid * bid, q.bid), min(clip, room)))
     return out

@@ -31,11 +31,10 @@ class Guard:
         hard = self.b / 2
         return 0.0 if buffer is None or buffer >= hard else min(1.0, (hard - buffer) / hard)
 
-    async def step(self, symbol: str, venues: tuple[Venue, ...], notional_usd: float) -> float:
+    async def step(self, symbol: str, buffers: dict[Venue, float | None], notional_usd: float) -> float:
         """Top up what can be topped up; return the fraction of the pair to shrink now (the worst leg decides)."""
         f = 0.0
-        for v in venues:
-            b = v.buffer(symbol)
+        for v, b in buffers.items():
             if b is not None and b < self.b and v.isolated(symbol) and time.time() - self._topped.get((v.name, symbol), 0) > TOP_UP_EVERY_S:
                 add = min((2 * self.b - b) * notional_usd, v.free())
                 if add > 0:

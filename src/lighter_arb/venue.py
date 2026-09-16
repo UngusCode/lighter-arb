@@ -28,7 +28,7 @@ from .strategy import Quote, Side, Top
 
 log = Log("venue")
 ORDER_EXPIRY_S = 300  # resting orders carry the venue-minimum expiry and are re-created a minute before it
-REQUOTE_TOL_BPS = 2.0  # a resting quote is left alone unless its target moved more than this (or a fifth of its distance from the touch)
+REQUOTE_TOL_BPS = 2.0  # a resting quote is left alone unless its target moved more than this
 PING_EVERY_S = 20.0  # the venue's application-level keepalive: we ping, it pongs
 SILENT_S = 60.0  # a socket with no message for this long is dead: close it and reconnect
 SQUEEZE_S = 60.0  # after a margin reject, how long the venue is taken to have no free balance: no creates until then
@@ -135,8 +135,8 @@ class _Ws(WsClient):
 
 
 class Venue:
-    def __init__(self, name: str, cfg: VenueCfg) -> None:
-        self.name, self.cfg = name, cfg
+    def __init__(self, name: str, cfg: VenueCfg, leverage: int) -> None:
+        self.name, self.cfg, self.leverage = name, cfg, leverage
         self.markets: dict[str, Market] = {}
         self._by_id: dict[str, str] = {}  # str(market_id) -> symbol, as the SDK keys its book states
         self._positions: dict[str, float] = {}
@@ -212,11 +212,20 @@ class Venue:
 
     # ----- state -----
     def side(self, symbol: str, name: str) -> Side:
-        """One side of the book as (price, size), best first. The SDK keeps each side as a list of strings in arrival order."""
-        book = self._ws.order_book_states.get(str(self.markets[symbol].id)) if self._ws else None
-        return sorted(((float(o["price"]), float(o["size"])) for o in (book or {}).get(name, ())), reverse=name == "bids")
+        """One side of the book as (price, size), best first, less our own resting orders: the touch a quote may not rest inside,
+        the mid the premium is measured from and the depth a taker order counts on are the rest of the market, not our own quote.
+        The SDK keeps each side as a list of strings in arrival order."""
+        m = self.markets[symbol]
+        book = self._ws.order_book_states.get(str(m.id)) if self._ws else None
+        mine: dict[int, float] = {}
+        for o in self._orders.values():
+            if o.symbol == symbol and o.is_ask == (name == "asks"):
+                mine[round(o.price * 10**m.price_dec)] = mine.get(round(o.price * 10**m.price_dec), 0.0) + o.size
+        levels = ((float(o["price"]), float(o["size"]) - mine.get(round(float(o["price"]) * 10**m.price_dec), 0.0)) for o in (book or {}).get(name, ()))
+        return sorted(((p, q) for p, q in levels if q > 0), reverse=name == "bids")
 
     def top(self, symbol: str) -> Top | None:
+        """The rest of the market's touch; None while either side is empty or the book is crossed, when nothing of ours rests."""
         bids, asks = self.side(symbol, "bids"), self.side(symbol, "asks")
         if not bids or not asks or bids[0][0] >= asks[0][0]:
             return None
@@ -230,11 +239,11 @@ class Venue:
     def position(self, symbol: str) -> float:
         return self._positions.get(symbol, 0.0)
 
-    def buffer(self, symbol: str) -> float | None:
-        """Adverse move that would liquidate the position here, as a fraction of price; None when the venue reports no
+    def buffer(self, symbol: str, mid: float) -> float | None:
+        """Adverse move from `mid` that would liquidate the position here, as a fraction of price; None when the venue reports no
         liquidation price (it cannot be liquidated with the collateral behind it) or there is no position."""
-        liq, t = self._liq.get(symbol, 0.0), self.top(symbol)
-        return abs(liq / ((t.bid + t.ask) / 2) - 1) if liq and t and self.position(symbol) else None
+        liq = self._liq.get(symbol, 0.0)
+        return abs(liq / mid - 1) if liq and self.position(symbol) else None
 
     @property
     def equity(self) -> float | None:
@@ -244,12 +253,14 @@ class Venue:
         return self._collateral + sum(float(p["allocated_margin"] or 0) + float(p["unrealized_pnl"] or 0) for p in self._raw.values())
 
     def free(self) -> float:
-        """Free balance an entry may count on: collateral plus unrealized pnl less the initial margin of every cross position, which
-        is the venue's available balance to within a dollar; nothing for a while after the venue rejected an order for margin."""
+        """Free balance an entry may count on: collateral plus unrealized pnl, less the initial margin of every cross position and of
+        what every resting order would add to one (the venue counts those too; the part that would reduce a position is free);
+        nothing for a while after the venue rejected an order for margin."""
         if self._collateral is None or time.time() < self._squeezed_until:
             return 0.0
         im = sum(abs(float(p["position_value"])) * float(p["initial_margin_fraction"]) / 100 for p in self._raw.values() if not int(p["margin_mode"] or 0))
-        return self._collateral + sum(float(p["unrealized_pnl"] or 0) for p in self._raw.values()) - im
+        opening = sum(max(0.0, o.size - max(0.0, self.position(o.symbol) * (1 if o.is_ask else -1))) * o.price for o in self._orders.values())
+        return self._collateral + sum(float(p["unrealized_pnl"] or 0) for p in self._raw.values()) - im - opening / self.leverage
 
     async def track(self, symbols: set[str]) -> None:
         """Take a market's book as well (a position found at startup in a market not on the list)."""
@@ -399,11 +410,9 @@ class Venue:
                 live = None
             if q is None:
                 continue
-            touch = (t.bid if is_ask else t.ask) if (t := self.top(symbol)) else q.price
-            tol = max(REQUOTE_TOL_BPS, 0.2 * abs(q.price / touch - 1) * 1e4)  # far from the touch, precision is not worth a tx
-            if live and abs(q.size / live.size - 1) <= 0.2 and abs(q.price / live.price - 1) * 1e4 <= tol:
+            if live and abs(q.size / live.size - 1) <= 0.2 and abs(q.price / live.price - 1) * 1e4 <= REQUOTE_TOL_BPS:
                 continue  # the resting order is inside the deadband
-            p_int, q_int, price, size = self._round(symbol, q.price, q.size, is_ask)
+            p_int, q_int, price, size = self._round(symbol, q.price, q.size, down=not is_ask)  # a tick toward passive
             if not self.tradable(symbol, price, size):
                 continue
             if not live and squeezed:
@@ -438,7 +447,7 @@ class Venue:
         if limit is None:
             limit = touch * (1 - max_slip_bps / 1e4) if is_ask else touch * (1 + max_slip_bps / 1e4)  # still fills if the touch moves a tick
             size = min(size, self.depth(symbol, is_ask, max_slip_bps))
-        p_int, q_int, price, size = self._round(symbol, limit, size, not is_ask)  # round toward the aggressive side
+        p_int, q_int, price, size = self._round(symbol, limit, size, down=is_ask)  # a tick toward aggressive
         if q_int <= 0:  # the venue's minimum sizes bind resting orders only: a taker can be any size the market's decimals allow
             return
         log.info("hedge", venue=self.name, symbol=symbol, side="sell" if is_ask else "buy", touch=touch, limit=price, size=size)
@@ -458,10 +467,10 @@ class Venue:
         await self._send(self._sign("sign_cancel_all_orders", CANCEL_ALL_ID, time_in_force=tif, timestamp_ms=ts))
 
     # ----- implementation -----
-    def _round(self, symbol: str, price: float, size: float, passive_low: bool) -> tuple[int, int, float, float]:
-        """Venue integer price and size, rounding price down when passive_low (a bid) else up. Returns (p_int, q_int, price, size)."""
+    def _round(self, symbol: str, price: float, size: float, down: bool) -> tuple[int, int, float, float]:
+        """Venue integer price and size, the price rounded down or up to the tick, the size down. Returns (p_int, q_int, price, size)."""
         m = self.markets[symbol]
-        p_int = math.floor(price * 10**m.price_dec) if passive_low else math.ceil(price * 10**m.price_dec)
+        p_int = math.floor(price * 10**m.price_dec) if down else math.ceil(price * 10**m.price_dec)
         q_int = math.floor(size * 10**m.size_dec)
         return p_int, q_int, p_int / 10**m.price_dec, q_int / 10**m.size_dec
 
