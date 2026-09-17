@@ -45,7 +45,7 @@ class Average:
     def update(self, x: float, now: float) -> None:
         if self.value is None:
             self.value, self._since = x, now
-        else:
+        elif self._t:  # a seed's first sample only starts the clock
             self.value += (1 - math.exp(-(now - self._t) / self.tau)) * (x - self.value)
         self._t = now
 
