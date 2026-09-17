@@ -2,7 +2,7 @@
 
 The SDK does the socket, book deltas, signing, nonces and REST. This adds only what the SDK has no notion of:
 market rounding and minimums, which side of a trade is ours, which of our orders are resting, pushing signed
-transactions over the socket, and the scheduled cancel-all."""
+transactions over the socket, and the cancel-all."""
 
 from __future__ import annotations
 
@@ -27,11 +27,13 @@ from .log import Log
 from .strategy import Quote, Side, Top
 
 log = Log("venue")
-ORDER_EXPIRY_S = 300  # resting orders carry the venue-minimum expiry and are re-created a minute before it
-REQUOTE_TOL_BPS = 2.0  # a resting quote is left alone unless its target moved more than this
+ORDER_EXPIRY_S = 300  # resting orders carry the venue-minimum expiry and are re-created a minute before it: the venue clears the book by itself if we die
+REQUOTE_TOL_BPS = 10.0  # a resting quote is left alone unless its target moved more than this: every modify costs volume quota
 PING_EVERY_S = 20.0  # the venue's application-level keepalive: we ping, it pongs
 SILENT_S = 60.0  # a socket with no message for this long is dead: close it and reconnect
 SQUEEZE_S = 60.0  # after a margin reject, how long the venue is taken to have no free balance: no creates until then
+PAUSE_S = 60.0  # after a rate-limit reject, how long nothing is quoted on the venue: resting orders cancelled (free), no creates or modifies
+PACE_S = 16.0  # at most one create or modify per venue this often: the venue gives one free transaction every 15 s, so no volume quota is spent
 SNAPSHOT_GRACE_S = 3.0  # an order sent this recently may not be in an account snapshot yet: the snapshot does not drop it
 CANCEL_ALL_ID = 0  # tx ids below 1 are ours for account-level txs; orders use client order indexes from a running counter
 LEVERAGE_ID, MARGIN_ID = -1, -1_000_000  # minus the market id
@@ -144,7 +146,8 @@ class Venue:
         self.avg_entry: dict[str, float] = {}  # venue-reported average entry price per position; survives our restarts
         self._collateral: float | None = None  # the settlement asset's margin balance, from the account snapshot
         self._squeezed_until = 0.0  # after a margin reject: no free balance until then, whatever the snapshot says
-        self.deadman_ok = time.time()  # when the venue last accepted a cancel-all: the safety net's heartbeat
+        self._paused_until = 0.0  # after a rate-limit reject: nothing quoted until then
+        self._next_order_tx = 0.0  # the pace: when the next create or modify may go out
         self._liq: dict[str, float] = {}  # symbol -> liquidation price the venue reports for the position, 0 when none
         self._isolated: dict[str, bool] = {}
         self._orders: dict[int, Order] = {}
@@ -313,23 +316,21 @@ class Venue:
 
     # ----- inbound -----
     def _on_tx_response(self, msg: dict) -> None:
-        """Venue's answer to a tx we pushed over the socket, matched by the client order ids we sent as the id."""
-        cois = [int(c) for c in msg["id"].split(",")]
+        """Venue's answer to a tx we pushed over the socket, matched by the client order id we sent as the id."""
+        coi = int(msg["id"])
         if not msg.get("error"):
-            if CANCEL_ALL_ID in cois:
-                self.deadman_ok = time.time()
-            for coi in cois:
-                self._pending.pop(coi, None)
+            self._pending.pop(coi, None)
             return
         log.warning("tx.reject", venue=self.name, id=msg["id"], err=msg["error"])
         if msg["error"].get("code") == 21739:  # not enough margin: whatever the last read said, there is none to spare for a while
             self._squeezed_until = time.time() + SQUEEZE_S
-        for coi in cois:  # a rejected create never existed; a rejected modify or cancel leaves the original resting
-            kind, before = self._pending.pop(coi, ("create", None))
-            if kind == "create":
-                self._orders.pop(coi, None)
-            elif before is not None:
-                self._orders[coi] = before
+        elif msg["error"].get("code") == 23000:  # rate limited (volume quota): re-sending would only keep it exhausted
+            self._paused_until = time.time() + PAUSE_S
+        kind, before = self._pending.pop(coi, ("create", None))  # a rejected create never existed; a rejected modify or cancel leaves the original resting
+        if kind == "create":
+            self._orders.pop(coi, None)
+        elif before is not None:
+            self._orders[coi] = before
 
     async def watch(self, symbol: str, on: bool = True) -> None:
         """Follow (or stop following) our orders on this market over the venue's authenticated per-market channel."""
@@ -393,30 +394,40 @@ class Venue:
             if s := self._by_id.get(str(mid)):
                 self._fills(s, trades)
 
-    # ----- outbound: one bid and one ask per market, pushed as one batch over the socket -----
+    # ----- outbound: one bid and one ask per market, pushed over the socket -----
     async def sync(self, symbol: str, want: dict[bool, Quote]) -> None:
-        """No order -> create. Moved -> modify in place. Unwanted or near expiry -> cancel."""
+        """No order -> create. Moved -> modify in place. Unwanted or near expiry -> cancel. Rate limited -> nothing rests for a while.
+        Cancels are free and go at once; creates and modifies are paced to the venue's free transaction, one per PACE_S."""
         txs: list[tuple[int, str, int]] = []
-        squeezed = time.time() < self._squeezed_until  # the venue just refused an order for margin: no creates for a while, exits included
+        now = time.time()
+        squeezed = now < self._squeezed_until  # the venue just refused an order for margin: no creates for a while, exits included
+        if now < self._paused_until:
+            want = {}
         for is_ask in (False, True):
             live = self.resting(symbol).get(is_ask)
             q = want.get(is_ask)
             for extra in self.surplus(symbol, is_ask):  # a second order on the same side (a snapshot race): cancel it
                 self._orders.pop(extra.coi)
                 txs += self._sign("sign_cancel_order", extra.coi, before=extra, market_index=self.markets[symbol].id, order_index=extra.coi)
-            if live and (q is None or time.time() - live.placed_at > ORDER_EXPIRY_S - 60):
+            if live and q is None:
                 self._orders.pop(live.coi)
                 txs += self._sign("sign_cancel_order", live.coi, before=live, market_index=self.markets[symbol].id, order_index=live.coi)
-                live = None
+                continue
             if q is None:
                 continue
-            if live and abs(q.size / live.size - 1) <= 0.2 and abs(q.price / live.price - 1) * 1e4 <= REQUOTE_TOL_BPS:
+            expiring = live is not None and now - live.placed_at > ORDER_EXPIRY_S - 60
+            if live and not expiring and abs(q.size / live.size - 1) <= 0.2 and abs(q.price / live.price - 1) * 1e4 <= REQUOTE_TOL_BPS:
                 continue  # the resting order is inside the deadband
+            if now < self._next_order_tx or (not live and squeezed):
+                continue  # not yet: the order that rests (if any) stays as it is
             p_int, q_int, price, size = self._round(symbol, q.price, q.size, down=not is_ask)  # a tick toward passive
             if not self.tradable(symbol, price, size):
                 continue
-            if not live and squeezed:
-                continue
+            if live and expiring:  # cancel (free) and re-create with a fresh expiry
+                self._orders.pop(live.coi)
+                txs += self._sign("sign_cancel_order", live.coi, before=live, market_index=self.markets[symbol].id, order_index=live.coi)
+                live = None
+            self._next_order_tx = now + PACE_S
             if live:
                 self._orders[live.coi] = live._replace(price=price, size=size)
                 txs += self._sign(
@@ -452,19 +463,16 @@ class Venue:
             return
         log.info("hedge", venue=self.name, symbol=symbol, side="sell" if is_ask else "buy", touch=touch, limit=price, size=size)
         self._coi += 1
+        self._next_order_tx = time.time() + PACE_S  # a taker order takes the free transaction too
         await self._send(
             self._sign("sign_create_order", self._coi, **self._order(symbol, q_int, p_int, is_ask, SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL, 0))
         )
 
-    async def cancel_all(self, deadline_s: float | None = None) -> None:
-        """Cancel everything now, or arm the venue's scheduled cancel-all (the dead-man, re-armed while we live; the venue wants
-        it over 5 minutes out). Over the socket like every tx: with the socket dead the armed one fires on its own, which is
-        what it is for, and the venue's acceptance is the safety net's heartbeat."""
-        if deadline_s is None:
-            self._orders.clear()
-        tif = SignerClient.CANCEL_ALL_TIF_SCHEDULED if deadline_s else SignerClient.CANCEL_ALL_TIF_IMMEDIATE
-        ts = int((time.time() + deadline_s) * 1000) if deadline_s else 0
-        await self._send(self._sign("sign_cancel_all_orders", CANCEL_ALL_ID, time_in_force=tif, timestamp_ms=ts))
+    async def cancel_all(self) -> None:
+        """Cancel everything now. If the process dies instead, every resting order expires on its own within ORDER_EXPIRY_S."""
+        self._orders.clear()
+        self._next_order_tx = time.time() + PACE_S  # a cancel-all takes the free transaction too
+        await self._send(self._sign("sign_cancel_all_orders", CANCEL_ALL_ID, time_in_force=SignerClient.CANCEL_ALL_TIF_IMMEDIATE, timestamp_ms=0))
 
     # ----- implementation -----
     def _round(self, symbol: str, price: float, size: float, down: bool) -> tuple[int, int, float, float]:
@@ -496,22 +504,15 @@ class Venue:
                 "order_type": SignerClient.ORDER_TYPE_LIMIT, "time_in_force": tif, "reduce_only": False, "trigger_price": 0, "order_expiry": expiry}  # fmt: skip
 
     async def _send(self, txs: list[tuple[int, str, int]]) -> None:
-        """Push signed txs over the socket, one or a batch, and move on: the venue's answer comes back by id and settles the
-        local state then. A dead socket is not fatal: the txs count as rejected so local state is restored, and the reconnect
-        loop brings the feed back. An answer that never comes is settled by the next account snapshot."""
-        if not txs:
-            return
-        ident = ",".join(str(coi) for _, _, coi in txs)
-        if len(txs) == 1:
-            msg = {"type": "jsonapi/sendtx", "data": {"id": ident, "tx_type": txs[0][0], "tx_info": json.loads(txs[0][1])}}
-        else:
-            msg = {
-                "type": "jsonapi/sendtxbatch",
-                "data": {"id": ident, "tx_types": json.dumps([t for t, _, _ in txs]), "tx_infos": json.dumps([i for _, i, _ in txs])},
-            }
-        try:
-            assert self._ws and self._ws.ws
-            await self._ws.ws.send(json.dumps(msg))  # type: ignore[func-returns-value]  # SDK leaves the socket untyped
-        except Exception as e:
-            log.warning("send.failed", venue=self.name, err=repr(e))
-            self._on_tx_response({"id": ident, "error": {"code": -1, "message": "send failed"}})
+        """Push signed txs over the socket one by one (only a single send can be the venue's free transaction) and move on: the
+        venue's answer comes back by id and settles the local state then. A dead socket is not fatal: the tx counts as rejected
+        so local state is restored, and the reconnect loop brings the feed back. An answer that never comes is settled by the
+        next account snapshot."""
+        for tx_type, tx_info, coi in txs:
+            msg = {"type": "jsonapi/sendtx", "data": {"id": str(coi), "tx_type": tx_type, "tx_info": json.loads(tx_info)}}
+            try:
+                assert self._ws and self._ws.ws
+                await self._ws.ws.send(json.dumps(msg))  # type: ignore[func-returns-value]  # SDK leaves the socket untyped
+            except Exception as e:
+                log.warning("send.failed", venue=self.name, err=repr(e))
+                self._on_tx_response({"id": str(coi), "error": {"code": -1, "message": "send failed"}})

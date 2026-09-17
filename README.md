@@ -47,8 +47,13 @@ Logs go to stdout, one line per fill, hedge, cross, reject and halt, plus a `sta
 market's gap, premium average, resting orders, liquidation buffer, inventory and unhedged amount. The premium average is
 what to seed the market with next time.
 
-Under systemd, set `Restart=no`. A halted bot should stay down until someone has looked, and the scheduled cancel-all,
-refreshed every 30 seconds, clears the books if the process dies.
+Under systemd, set `Restart=no`. A halted bot should stay down until someone has looked. Every resting order carries the
+venue's five-minute expiry, so the venue clears the books by itself if the process dies.
+
+Lighter meters transactions by volume quota: creates, modifies and cancel-alls each spend one, a plain cancel is free, and
+an account earns one per 2 USD traded plus one free transaction every 15 seconds. The bot lives on the free ones: creates and
+modifies go out one per 16 seconds per venue, a resting order is moved only when its target has drifted 10 bps, and a
+rate-limit reject cancels what rests and pauses the venue for a minute rather than re-sending.
 
 ## Layout
 

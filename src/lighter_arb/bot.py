@@ -24,7 +24,6 @@ ENTRY_PAUSE_S = 2.0  # no new entry on a market this soon after a fill there: th
 HEDGE_TRIES = 3  # hedge IOCs that may leave a mismatch standing before it is undone on the quote venue instead
 HEDGE_SLIP_BPS = 50.0  # a hedge IOC is limited this far past the touch: a cap, it still fills at the best available
 MAX_BOOK_AGE_MS = 1500.0  # older books on either venue pull the quotes
-DEADMAN_REFRESH_S, DEADMAN_WINDOW_S = 30.0, 360.0  # the scheduled cancel-all, refreshed this often, with this deadline (venue minimum 5 min)
 HALT_FILE = "HALT"  # touch it to halt
 SNAPSHOT_WAIT_S = 30.0  # startup gives the venues this long to send their account snapshots
 
@@ -152,7 +151,7 @@ class Bot:
             self.stop.set()
 
     async def risk_loop(self) -> None:
-        last_dm, next_status = 0.0, time.time() + STATUS_EVERY_S
+        next_status = time.time() + STATUS_EVERY_S
         while not self.stop.is_set() and not self.halted:
             await asyncio.sleep(1)
             eq = [v.equity for v in (self.q, self.h)]
@@ -172,12 +171,6 @@ class Bot:
                 await self.halt("halt_file")
             elif equity is not None and self.equity0 is not None and equity - self.equity0 < -self.cfg.drawdown_usd:
                 await self.halt("drawdown")
-            if time.time() - last_dm > DEADMAN_REFRESH_S:
-                last_dm = time.time()
-                for v in (self.q, self.h):
-                    await v.cancel_all(deadline_s=DEADMAN_WINDOW_S)
-            if any(time.time() - v.deadman_ok > DEADMAN_WINDOW_S - 60 for v in (self.q, self.h)):
-                await self.halt("deadman_unacknowledged")  # no accepted cancel-all in five minutes: never quote without the safety net
 
     async def run(self) -> None:
         for v in (self.q, self.h):
